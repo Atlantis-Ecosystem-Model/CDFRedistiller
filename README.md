@@ -190,6 +190,104 @@ if (countback_recruit) {
 
 - Does not yet work for migratory species. Migration dates likely need similar
   offset treatment.
+  
+## Forcing File Timing on Restart
+
+When restarting Atlantis from a checkpoint, the model continues with `bm->t`
+set to the restart time (e.g. `bm->t = 63072000` seconds for a restart at
+day 730). Whether each forcing source produces correct values on restart
+depends on **how that forcing is indexed in the C code**.
+
+### Restart-Safe Forcing (no action needed)
+
+These forcing sources use `tsEval(ts, var_id, bm->t)` from the Atlantis time
+series library, which interpolates by absolute time. Restart works correctly
+as long as the `.ts` file covers the restart period:
+
+| Forcing | Source file pattern | Code location |
+|---|---|---|
+| Forced effort | `Effortts*.data` in force.prm | `atManage.c:489-494` |
+| Imposed catch | catch `.ts` files | `atHarvestImposedCatch.c:282` |
+| Imposed discards | discard `.ts` files | `atHarvestDiscards.c:188` |
+| Forced recruitment | `tsRecruit` `.ts` files | `atdemography.c:1247, 4587` |
+| Environmental recruitment scalars | `Recruitment_enviro_forcing` | `atdemography.c:1686` |
+| KWSR forcing | `KWSR_forcing` | `atdemography.c:1716` |
+| Growth rate / FSPB / size scalers | various `.ts` files | `atecologyts.c`, `atannualbiology.c` |
+| Linear mortality scaler | `tslinearMort` | `atq10.c:79` |
+| pCO2 forcing | `tspCO2` `.ts` file | `atbiophysics.c:761` |
+| Fuel cost forcing | fuel `.ts` files | `ateconindicator.c:285, 626` |
+| Air temperature index | thermal index `.ts` | `atannualbiology.c:1266` |
+| MPA closures (timeseries) | MPA `.ts` files | `atManageMPATS.c:265` |
+
+For restart to work correctly with these, ensure your `.ts` files have time
+entries covering the restart day onward. Files using `days since YYYY-MM-DD`
+or `seconds since YYYY-MM-DD` as their time units are interpreted as absolute
+calendar times. Atlantis automatically reconciles unit differences between
+`.ts` files and the model via `tsNewTimeUnits`.
+
+### Restart-Unsafe Forcing (currently breaks on restart)
+
+The following forcing sources read records sequentially from netCDF files
+using a step counter (`nextrec`) rather than absolute time. On restart,
+`nextrec` initializes to 0 — so the model reads forcing values from the
+**beginning of the file** while the simulation thinks it is at the restart
+time. This causes a multi-year offset between the forcing applied and the
+forcing intended.
+
+| Forcing | Source | Code location |
+|---|---|---|
+| Hydrodynamic exchange | hydro `.nc` files | `athydromod.c:216, 396` |
+| Temperature / salinity | tempsalt `.nc` files | `attempsalt.c:680, 820` |
+| Ice | ice `.nc` files | `aticeIO.c:1067, 1184` |
+
+The pattern in each case is:
+
+```c
+bm->hd.nextrec++;       // increment each timestep
+...
+bm->hd.nextrec = 0;     // initialize to 0 when file opens
+```
+
+There is no logic to seek forward to `bm->t` when the file is opened.
+
+### Two Options for Fixing netCDF Forcing on Restart
+
+**Option 1 — Modify `open_hydro` (and equivalents) to seek to `bm->t`** *(preferred, not yet implemented)*
+
+After opening the netCDF file, read the `t` variable, find the index
+where `t[i] >= bm->t`, and set `nextrec = i`. This makes the change once
+and all future restarts work automatically without per-restart file
+preparation. The same pattern applies to:
+- `open_hydro` in `atphysics/athydromod.c`
+- `open_phyprop` in `atphysics/attempsalt.c` (handles temperature, salinity, pH, wind, vertical mixing, light, noise, and tracer forcing)
+- `Ice_Read_Time_Series` in `atphysics/aticeIO.c`
+
+Estimated changes: ~10 lines of C per location, three locations.
+
+**Option 2 — Pre-trim netCDF forcing files to start at the restart time** *(no C changes required)*
+
+Use `ncks` to extract only the timesteps from the restart day onward:
+
+```bash
+# Trim hydro file (time in seconds since model epoch)
+ncks -d t,63072000.,3153600000. original_hydro.nc trimmed_hydro.nc
+
+# Trim tempsalt file
+ncks -d t,63072000.,3153600000. original_tempsalt.nc trimmed_tempsalt.nc
+```
+
+Then point your restart `force.prm` at the trimmed files. The model still
+starts `nextrec = 0`, but record 0 of the trimmed file now corresponds to
+the restart time. This option requires maintaining a separate set of
+forcing files per restart point.
+
+### Recommendation
+
+Option 1 is the long-term fix and removes any per-restart file
+preparation. It has not yet been implemented. Until then, Option 2 (file
+trimming) is the workaround for runs that include hydrodynamic, temperature,
+salinity, or ice forcing on restart.
+
 
 ## Companion R Code
 
